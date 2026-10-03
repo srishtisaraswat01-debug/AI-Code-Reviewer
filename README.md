@@ -9,7 +9,7 @@ An AI-powered code review application built using Python, Streamlit, Ollama, and
 - Get explanations of errors
 - Get code improvement suggestions
 - Generate corrected code
-- Supports multiple programming languages
+- Supports Python programming
 - Simple Streamlit interface
 
 ## Technologies Used
