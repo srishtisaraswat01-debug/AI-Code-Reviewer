@@ -1,5 +1,7 @@
+
 import ast
 import json
+import os
 import re
 from datetime import datetime
 
@@ -7,16 +9,23 @@ import requests
 import streamlit as st
 
 st.set_page_config(page_title="AI Code Reviewer Pro", page_icon="🔎", layout="wide")
+
 OLLAMA_URL = "http://localhost:11434/api/generate"
-DEFAULT_MODEL = "llama3.2"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+DEFAULT_OLLAMA_MODEL = "llama3.2"
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 st.title("🔎 AI Code Reviewer Pro")
-st.caption("Static analysis + local AI review powered by Ollama")
+if GEMINI_API_KEY:
+    st.caption(f"Static analysis + cloud AI review powered by Gemini ({GEMINI_MODEL})")
+else:
+    st.caption("Static analysis + local AI review powered by Ollama")
 
 with st.sidebar:
     st.header("Review settings")
-    model_name = st.text_input("Ollama model", value=DEFAULT_MODEL)
-    st.caption("Use a model name shown by `ollama list`.")
+    model_name = st.text_input("Local Ollama model", value=DEFAULT_OLLAMA_MODEL)
+    st.caption("Used when GEMINI_API_KEY is not configured.")
     show_debug = st.toggle("Show technical details", value=False)
     st.divider()
     st.markdown("**Checks included**")
@@ -55,7 +64,6 @@ def get_static_findings(source):
         })
         return False, findings
 
-    # Pyflakes is optional. If installed, it checks undefined and unused names.
     try:
         from pyflakes.api import check
         from pyflakes.reporter import Reporter
@@ -81,8 +89,6 @@ def get_static_findings(source):
             "suggestion": "Install it with: python -m pip install pyflakes"
         })
 
-    # A deliberately narrow heuristic for the reversed pass/fail example.
-    # It does not claim to detect arbitrary logic bugs.
     pattern = r'if\s+marks?\s*>=\s*40\s*:\s*print\s*\(\s*[\'\"]fail[\'\"]\s*\)'
     if re.search(pattern, source, re.IGNORECASE):
         findings.append({
@@ -161,27 +167,64 @@ Code:
 ```'''
 
     ai_review = ""
+    ai_provider = "Gemini" if GEMINI_API_KEY else "Ollama"
     with ai_tab:
         st.markdown("### AI analysis")
         try:
-            with st.spinner(f"Requesting review from Ollama ({model_name})..."):
-                response = requests.post(
-                    OLLAMA_URL,
-                    json={"model": model_name, "prompt": prompt, "stream": False},
-                    timeout=120
-                )
-            response.raise_for_status()
-            ai_review = response.json().get("response", "").strip()
+            if GEMINI_API_KEY:
+                with st.spinner(f"Requesting cloud review from Gemini ({GEMINI_MODEL})..."):
+                    response = requests.post(
+                        f"{GEMINI_URL}/{GEMINI_MODEL}:generateContent",
+                        headers={
+                            "x-goog-api-key": GEMINI_API_KEY,
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "contents": [{"parts": [{"text": prompt}]}],
+                            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 4096},
+                        },
+                        timeout=120,
+                    )
+                response.raise_for_status()
+                result = response.json()
+                candidates = result.get("candidates", [])
+                if candidates:
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    ai_review = "\n".join(
+                        part.get("text", "") for part in parts if part.get("text")
+                    ).strip()
+                if not ai_review:
+                    st.error("Gemini returned an empty response. Check model access and API quota.")
+            else:
+                with st.spinner(f"Requesting local review from Ollama ({model_name})..."):
+                    response = requests.post(
+                        OLLAMA_URL,
+                        json={"model": model_name, "prompt": prompt, "stream": False},
+                        timeout=120,
+                    )
+                response.raise_for_status()
+                ai_review = response.json().get("response", "").strip()
+                if not ai_review:
+                    st.error("Ollama returned an empty response.")
+
             if ai_review:
                 st.markdown(ai_review)
-            else:
-                st.error("Ollama returned an empty response.")
+
         except requests.exceptions.ConnectionError:
-            st.error("Could not connect to Ollama at localhost:11434. Make sure Ollama is running.")
+            if GEMINI_API_KEY:
+                st.error("Could not connect to the Gemini API. Check the Render service network and try again.")
+            else:
+                st.error("Could not connect to Ollama at localhost:11434. Make sure Ollama is running.")
         except requests.exceptions.Timeout:
-            st.error("Ollama took too long to respond. Try again or use a smaller model.")
-        except (requests.exceptions.RequestException, ValueError) as exc:
-            st.error("The request to Ollama failed.")
+            st.error(f"{ai_provider} took too long to respond. Please try again.")
+        except requests.exceptions.HTTPError as exc:
+            st.error(f"{ai_provider} API request failed (HTTP {response.status_code}).")
+            if GEMINI_API_KEY and response.status_code in (400, 401, 403):
+                st.info("Check the GEMINI_API_KEY setting in Render and confirm the model is available to the key.")
+            if show_debug:
+                st.code(response.text[:2000])
+        except (requests.exceptions.RequestException, ValueError, KeyError, IndexError) as exc:
+            st.error(f"The request to {ai_provider} failed.")
             if show_debug:
                 st.code(str(exc))
 
@@ -205,7 +248,7 @@ Code:
     report = {
         "project": "AI Code Reviewer Pro",
         "created_at": datetime.now().isoformat(timespec="seconds"),
-        "model": model_name,
+        "model": GEMINI_MODEL if GEMINI_API_KEY else model_name,
         "syntax_valid": syntax_valid,
         "static_findings": static_findings,
         "submitted_code": code,
